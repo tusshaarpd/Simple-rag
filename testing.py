@@ -1,0 +1,202 @@
+import numpy as np
+import pandas as pd
+import streamlit as st
+from scipy.stats import proportions_ztest
+
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="A/B Testing Agent", layout="wide")
+st.title("A/B Testing Agent")
+st.markdown("Upload your experiment data to get statistical insights and a recommendation.")
+
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+REQUIRED_COLUMNS = {"variant", "users", "conversions"}
+
+
+# ── Validation ────────────────────────────────────────────────────────────────
+def validate_dataframe(df: pd.DataFrame) -> str | None:
+    """Return an error message string, or None if valid."""
+    missing = REQUIRED_COLUMNS - set(df.columns.str.lower())
+    if missing:
+        return f"Missing required columns: {', '.join(missing)}. Expected: variant, users, conversions."
+    df.columns = df.columns.str.lower()
+    variants = df["variant"].str.upper().unique().tolist()
+    if "A" not in variants or "B" not in variants:
+        return f"Expected variants 'A' and 'B', but found: {variants}."
+    for col in ["users", "conversions"]:
+        if not pd.to_numeric(df[col], errors="coerce").notna().all():
+            return f"Column '{col}' must contain numeric values only."
+    return None
+
+
+# ── Metrics computation ───────────────────────────────────────────────────────
+def compute_metrics(df: pd.DataFrame) -> dict:
+    df = df.copy()
+    df.columns = df.columns.str.lower()
+    df["variant"] = df["variant"].str.upper()
+
+    row_a = df[df["variant"] == "A"].iloc[0]
+    row_b = df[df["variant"] == "B"].iloc[0]
+
+    users_a, conv_a = int(row_a["users"]), int(row_a["conversions"])
+    users_b, conv_b = int(row_b["users"]), int(row_b["conversions"])
+
+    rate_a = conv_a / users_a
+    rate_b = conv_b / users_b
+    abs_diff = rate_b - rate_a
+    uplift = ((rate_b - rate_a) / rate_a) * 100 if rate_a > 0 else 0.0
+
+    z_stat, p_value = proportions_ztest(
+        count=[conv_a, conv_b],
+        nobs=[users_a, users_b],
+    )
+
+    return {
+        "users_a": users_a,
+        "users_b": users_b,
+        "conv_a": conv_a,
+        "conv_b": conv_b,
+        "rate_a": rate_a,
+        "rate_b": rate_b,
+        "abs_diff": abs_diff,
+        "uplift": uplift,
+        "z_stat": z_stat,
+        "p_value": p_value,
+        "significant": p_value < 0.05,
+        "confidence": (1 - p_value) * 100,
+    }
+
+
+# ── Recommendation ────────────────────────────────────────────────────────────
+def generate_recommendation(m: dict) -> tuple:
+    """Return (recommendation_text, streamlit_widget_type)."""
+    better = "B" if m["rate_b"] > m["rate_a"] else "A"
+    worse  = "A" if better == "B" else "B"
+
+    rate_a_pct = m["rate_a"] * 100
+    rate_b_pct = m["rate_b"] * 100
+    uplift     = abs(m["uplift"])
+    p_val      = m["p_value"]
+    conf       = min(m["confidence"], 99.9)
+
+    if m["significant"]:
+        if better == "B":
+            text = (
+                f"**Ship B.** Variant B outperforms A with a conversion rate of "
+                f"{rate_b_pct:.2f}% vs {rate_a_pct:.2f}% — a {uplift:.1f}% uplift. "
+                f"The result is statistically significant (p = {p_val:.4f}, {conf:.1f}% confidence), "
+                f"meaning it is very unlikely to be due to chance. "
+                f"Recommend rolling out Variant B to all users."
+            )
+            return text, "success"
+        else:
+            text = (
+                f"**Keep A.** Variant A outperforms B with a conversion rate of "
+                f"{rate_a_pct:.2f}% vs {rate_b_pct:.2f}%. "
+                f"The result is statistically significant (p = {p_val:.4f}, {conf:.1f}% confidence). "
+                f"Variant B underperforms — do not ship it."
+            )
+            return text, "error"
+    else:
+        text = (
+            f"**Run the test longer.** Variant {better} currently shows a slightly higher "
+            f"conversion rate ({rate_b_pct:.2f}% vs {rate_a_pct:.2f}%), but the result is "
+            f"**not statistically significant** (p = {p_val:.4f}, {conf:.1f}% confidence). "
+            f"There is insufficient evidence to declare a winner. "
+            f"Collect more data before making a decision."
+        )
+        return text, "warning"
+
+
+# ── File loading ──────────────────────────────────────────────────────────────
+def load_file(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+    return pd.read_excel(uploaded_file, engine="openpyxl")
+
+
+# ── Main UI ───────────────────────────────────────────────────────────────────
+uploaded_file = st.file_uploader(
+    "Upload your A/B test data (CSV or Excel)",
+    type=["csv", "xlsx"],
+)
+
+if uploaded_file is not None:
+    if len(uploaded_file.getvalue()) > MAX_FILE_SIZE_BYTES:
+        st.error(
+            f"File too large ({len(uploaded_file.getvalue()) / 1024 / 1024:.1f} MB). "
+            "Maximum allowed size is 10 MB."
+        )
+        st.stop()
+
+    try:
+        df = load_file(uploaded_file)
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
+        st.stop()
+
+    # ── Preview ───────────────────────────────────────────────────────────────
+    st.subheader("Data Preview")
+    st.dataframe(df, use_container_width=True)
+
+    # ── Validate ──────────────────────────────────────────────────────────────
+    error = validate_dataframe(df)
+    if error:
+        st.error(error)
+        st.markdown(
+            "**Expected format:**\n```\nvariant, users, conversions\nA, 1000, 120\nB, 1000, 145\n```"
+        )
+        st.stop()
+
+    # ── Compute ───────────────────────────────────────────────────────────────
+    try:
+        m = compute_metrics(df)
+    except Exception as e:
+        st.error(f"Error computing metrics: {e}")
+        st.stop()
+
+    # ── Metrics display ───────────────────────────────────────────────────────
+    st.subheader("Key Metrics")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Conversion Rate — A", f"{m['rate_a'] * 100:.2f}%",
+                help=f"{m['conv_a']} conversions / {m['users_a']} users")
+    col2.metric("Conversion Rate — B", f"{m['rate_b'] * 100:.2f}%",
+                delta=f"{m['abs_diff'] * 100:+.2f}pp",
+                help=f"{m['conv_b']} conversions / {m['users_b']} users")
+    col3.metric("Uplift", f"{m['uplift']:+.1f}%",
+                help="Percentage change in conversion rate from A to B")
+    col4.metric("p-value", f"{m['p_value']:.4f}",
+                help="Probability of observing this result by chance if there is no real difference")
+
+    st.markdown("---")
+
+    # ── Significance ──────────────────────────────────────────────────────────
+    st.subheader("Statistical Significance")
+
+    sig_col1, sig_col2, sig_col3 = st.columns(3)
+    sig_col1.metric("Confidence Level", f"{min(m['confidence'], 99.9):.1f}%")
+    sig_col2.metric("Significance Threshold", "95%")
+    sig_col3.metric(
+        "Result",
+        "Significant ✓" if m["significant"] else "Not Significant ✗",
+    )
+
+    st.markdown("---")
+
+    # ── Recommendation ────────────────────────────────────────────────────────
+    st.subheader("Recommendation")
+    rec_text, widget_type = generate_recommendation(m)
+
+    if widget_type == "success":
+        st.success(rec_text)
+    elif widget_type == "error":
+        st.error(rec_text)
+    else:
+        st.warning(rec_text)
+
+else:
+    st.info(
+        "Upload a CSV or Excel file with columns: **variant**, **users**, **conversions**.\n\n"
+        "Example:\n```\nvariant,users,conversions\nA,1000,120\nB,1000,145\n```"
+    )
