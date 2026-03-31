@@ -1,15 +1,14 @@
 import os
 import tempfile
 
+import faiss
+import numpy as np
 import pandas as pd
 import streamlit as st
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from openai import OpenAI
 from pypdf import PdfReader
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Chat with your Documents", layout="wide")
 st.title("Chat with your Documents")
 
@@ -28,64 +27,101 @@ with st.sidebar:
         "**Max file size:** 10 MB"
     )
 
-MAX_FILE_SIZE_MB = 10
-MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
 
-# ── Text extraction helpers ───────────────────────────────────────────────────
+# ── Text extraction ───────────────────────────────────────────────────────────
 def extract_text_from_pdf(uploaded_file) -> str:
-    """Extract all text from an uploaded PDF file."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
     try:
         reader = PdfReader(tmp_path)
-        pages = [page.extract_text() or "" for page in reader.pages]
-        return "\n".join(pages)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
     finally:
         os.unlink(tmp_path)
 
 
 def extract_text_from_excel(uploaded_file) -> str:
-    """Convert each row of an Excel file to a readable string."""
     df = pd.read_excel(uploaded_file, engine="openpyxl")
-    # Represent each row as "col1: val1 | col2: val2 | ..."
-    rows = []
-    for _, row in df.iterrows():
-        row_text = " | ".join(f"{col}: {val}" for col, val in row.items())
-        rows.append(row_text)
+    rows = [" | ".join(f"{col}: {val}" for col, val in row.items())
+            for _, row in df.iterrows()]
     return "\n".join(rows)
 
 
-# ── Vector store builder ──────────────────────────────────────────────────────
-def build_vectorstore(text: str, api_key: str) -> FAISS:
-    """Chunk text and create a FAISS vector store."""
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    chunks = splitter.create_documents([text])
-    embeddings = OpenAIEmbeddings(openai_api_key=api_key)
-    return FAISS.from_documents(chunks, embeddings)
+# ── Chunking ──────────────────────────────────────────────────────────────────
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list:
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunks.append(" ".join(words[i: i + chunk_size]))
+        i += chunk_size - overlap
+    return chunks
+
+
+# ── Embeddings ────────────────────────────────────────────────────────────────
+def get_embeddings(texts: list, api_key: str) -> np.ndarray:
+    client = OpenAI(api_key=api_key)
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts,
+    )
+    return np.array([item.embedding for item in response.data], dtype="float32")
+
+
+# ── Vector index ──────────────────────────────────────────────────────────────
+def build_index(chunks: list, api_key: str):
+    embeddings = get_embeddings(chunks, api_key)
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    return index, chunks
+
+
+# ── Answer generation ─────────────────────────────────────────────────────────
+def answer_question(question: str, index, chunks: list, api_key: str) -> str:
+    client = OpenAI(api_key=api_key)
+    q_embedding = get_embeddings([question], api_key)
+    _, indices = index.search(q_embedding, k=4)
+    context = "\n\n".join(chunks[i] for i in indices[0] if i < len(chunks))
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Answer the question using only the context provided. "
+                    "If the answer is not in the context, say you don't know."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Context:\n{context}\n\nQuestion: {question}",
+            },
+        ],
+    )
+    return response.choices[0].message.content
 
 
 # ── Main UI ───────────────────────────────────────────────────────────────────
-uploaded_file = st.file_uploader(
-    "Upload a PDF or Excel file",
-    type=["pdf", "xlsx"],
-)
+uploaded_file = st.file_uploader("Upload a PDF or Excel file", type=["pdf", "xlsx"])
 
 if uploaded_file is not None:
-    # Enforce file size limit
-    file_bytes = uploaded_file.getvalue()
-    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
-        st.error(f"File is too large ({len(file_bytes) / 1024 / 1024:.1f} MB). Maximum allowed size is {MAX_FILE_SIZE_MB} MB.")
+    if len(uploaded_file.getvalue()) > MAX_FILE_SIZE_BYTES:
+        st.error(
+            f"File is too large "
+            f"({len(uploaded_file.getvalue()) / 1024 / 1024:.1f} MB). "
+            f"Maximum allowed size is 10 MB."
+        )
         st.stop()
 
-    # Only (re-)process when a new file is uploaded
     if st.session_state.get("processed_file") != uploaded_file.name:
         if not openai_api_key:
             st.warning("Please enter your OpenAI API key in the sidebar before uploading.")
             st.stop()
 
-        with st.spinner("Extracting text and building vector store..."):
+        with st.spinner("Extracting text and building index..."):
             try:
                 if uploaded_file.name.endswith(".pdf"):
                     text = extract_text_from_pdf(uploaded_file)
@@ -93,23 +129,25 @@ if uploaded_file is not None:
                     text = extract_text_from_excel(uploaded_file)
 
                 if not text.strip():
-                    st.error("Could not extract any text from the file. Please check the file contents.")
+                    st.error("Could not extract any text from the file.")
                     st.stop()
 
-                vectorstore = build_vectorstore(text, openai_api_key)
-                st.session_state["vectorstore"] = vectorstore
+                chunks = chunk_text(text)
+                index, chunks = build_index(chunks, openai_api_key)
+                st.session_state["index"] = index
+                st.session_state["chunks"] = chunks
                 st.session_state["processed_file"] = uploaded_file.name
 
             except Exception as e:
                 st.error(f"Error processing file: {e}")
                 st.stop()
 
-        st.success(f"Ready! '{uploaded_file.name}' has been processed. Ask your question below.")
+        st.success(f"Ready! '{uploaded_file.name}' processed. Ask your question below.")
     else:
         st.info(f"Using already-processed file: **{uploaded_file.name}**")
 
-# ── Question & Answer ─────────────────────────────────────────────────────────
-if "vectorstore" in st.session_state:
+# ── Q&A ───────────────────────────────────────────────────────────────────────
+if "index" in st.session_state:
     question = st.text_input("Ask a question about your document:")
 
     if question:
@@ -119,22 +157,12 @@ if "vectorstore" in st.session_state:
 
         with st.spinner("Thinking..."):
             try:
-                llm = ChatOpenAI(
-                    model="gpt-3.5-turbo",
-                    temperature=0,
-                    openai_api_key=openai_api_key,
+                answer = answer_question(
+                    question,
+                    st.session_state["index"],
+                    st.session_state["chunks"],
+                    openai_api_key,
                 )
-                docs = st.session_state["vectorstore"].similarity_search(question, k=4)
-                context = "\n\n".join(doc.page_content for doc in docs)
-                prompt = ChatPromptTemplate.from_template(
-                    "Use the context below to answer the question. "
-                    "If the answer is not in the context, say you don't know.\n\n"
-                    "Context:\n{context}\n\n"
-                    "Question: {question}"
-                )
-                chain = prompt | llm
-                response = chain.invoke({"context": context, "question": question})
-                answer = response.content
             except Exception as e:
                 st.error(f"Error generating answer: {e}")
                 st.stop()
