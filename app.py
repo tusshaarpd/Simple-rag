@@ -3,8 +3,8 @@ import tempfile
 
 import pandas as pd
 import streamlit as st
-from langchain.chains import RetrievalQA
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pypdf import PdfReader
@@ -124,14 +124,17 @@ if "vectorstore" in st.session_state:
                     temperature=0,
                     openai_api_key=openai_api_key,
                 )
-                qa_chain = RetrievalQA.from_chain_type(
-                    llm=llm,
-                    retriever=st.session_state["vectorstore"].as_retriever(
-                        search_kwargs={"k": 4}
-                    ),
+                docs = st.session_state["vectorstore"].similarity_search(question, k=4)
+                context = "\n\n".join(doc.page_content for doc in docs)
+                prompt = ChatPromptTemplate.from_template(
+                    "Use the context below to answer the question. "
+                    "If the answer is not in the context, say you don't know.\n\n"
+                    "Context:\n{context}\n\n"
+                    "Question: {question}"
                 )
-                result = qa_chain.invoke({"query": question})
-                answer = result.get("result", "No answer found.")
+                chain = prompt | llm
+                response = chain.invoke({"context": context, "question": question})
+                answer = response.content
             except Exception as e:
                 st.error(f"Error generating answer: {e}")
                 st.stop()
