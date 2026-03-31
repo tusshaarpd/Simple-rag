@@ -46,11 +46,9 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     df.columns = df.columns.str.lower()
     df["variant"] = df["variant"].str.upper()
 
-    row_a = df[df["variant"] == "A"].iloc[0]
-    row_b = df[df["variant"] == "B"].iloc[0]
-
-    users_a, conv_a = int(row_a["users"]), int(row_a["conversions"])
-    users_b, conv_b = int(row_b["users"]), int(row_b["conversions"])
+    agg = df.groupby("variant")[["users", "conversions"]].sum()
+    users_a, conv_a = int(agg.loc["A", "users"]), int(agg.loc["A", "conversions"])
+    users_b, conv_b = int(agg.loc["B", "users"]), int(agg.loc["B", "conversions"])
 
     rate_a = conv_a / users_a
     rate_b = conv_b / users_b
