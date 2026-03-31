@@ -1,7 +1,19 @@
+import math
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-from scipy.stats import proportions_ztest
+
+
+def proportions_ztest(count, nobs):
+    """Two-proportion z-test (two-tailed), equivalent to scipy.stats.proportions_ztest."""
+    conv_a, conv_b = count
+    users_a, users_b = nobs
+    p_pool = (conv_a + conv_b) / (users_a + users_b)
+    se = math.sqrt(p_pool * (1 - p_pool) * (1 / users_a + 1 / users_b))
+    z_stat = (conv_b / users_b - conv_a / users_a) / se
+    p_value = math.erfc(abs(z_stat) / math.sqrt(2))
+    return z_stat, p_value
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="A/B Testing Agent", layout="wide")
