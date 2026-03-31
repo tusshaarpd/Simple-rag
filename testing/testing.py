@@ -3,6 +3,7 @@ import math
 import numpy as np
 import pandas as pd
 import streamlit as st
+from openai import OpenAI
 
 
 def proportions_ztest(count, nobs):
@@ -15,10 +16,25 @@ def proportions_ztest(count, nobs):
     p_value = math.erfc(abs(z_stat) / math.sqrt(2))
     return z_stat, p_value
 
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="A/B Testing Agent", layout="wide")
 st.title("A/B Testing Agent")
 st.markdown("Upload your experiment data to get statistical insights and a recommendation.")
+
+# ── Sidebar: AI configuration ─────────────────────────────────────────────────
+with st.sidebar:
+    st.header("AI Configuration")
+    openai_api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-...",
+        help="Your key is never stored or logged. Required for AI features.",
+    )
+    if openai_api_key:
+        st.success("API key provided.")
+    else:
+        st.info("Enter your OpenAI API key to unlock AI-powered analysis.")
 
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
 REQUIRED_COLUMNS = {"variant", "users", "conversions"}
@@ -80,7 +96,6 @@ def compute_metrics(df: pd.DataFrame) -> dict:
 def generate_recommendation(m: dict) -> tuple:
     """Return (recommendation_text, streamlit_widget_type)."""
     better = "B" if m["rate_b"] > m["rate_a"] else "A"
-    worse  = "A" if better == "B" else "B"
 
     rate_a_pct = m["rate_a"] * 100
     rate_b_pct = m["rate_b"] * 100
@@ -115,6 +130,126 @@ def generate_recommendation(m: dict) -> tuple:
             f"Collect more data before making a decision."
         )
         return text, "warning"
+
+
+# ── AI: Executive summary ─────────────────────────────────────────────────────
+def generate_exec_summary(m: dict, api_key: str) -> str:
+    """One-sentence plain-English summary for executives."""
+    user_prompt = (
+        "A/B test results:\n"
+        f"- Variant A: {m['users_a']:,} users, {m['conv_a']:,} conversions, "
+        f"{m['rate_a'] * 100:.2f}% conversion rate\n"
+        f"- Variant B: {m['users_b']:,} users, {m['conv_b']:,} conversions, "
+        f"{m['rate_b'] * 100:.2f}% conversion rate\n"
+        f"- Uplift: {m['uplift']:+.1f}%\n"
+        f"- p-value: {m['p_value']:.4f}\n"
+        f"- Statistically significant: {m['significant']}\n"
+        f"- Confidence: {min(m['confidence'], 99.9):.1f}%\n"
+        "Summarize the result in exactly one plain-English sentence."
+    )
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.3,
+        max_tokens=80,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise data analyst. Write exactly one plain-English sentence "
+                    "summarizing the outcome of an A/B test. No markdown, no bullet points. "
+                    "Be specific with numbers. Suitable for an executive reading in 5 seconds."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ── AI: Narrative analysis ────────────────────────────────────────────────────
+def generate_narrative(m: dict, rec_text: str, api_key: str) -> str:
+    """Full markdown business analysis of the A/B test results."""
+    user_prompt = (
+        "Analyze the following A/B test results and write a comprehensive business narrative.\n\n"
+        "## Test Data\n"
+        f"- Variant A: {m['users_a']:,} users, {m['conv_a']:,} conversions "
+        f"({m['rate_a'] * 100:.2f}% rate)\n"
+        f"- Variant B: {m['users_b']:,} users, {m['conv_b']:,} conversions "
+        f"({m['rate_b'] * 100:.2f}% rate)\n"
+        f"- Absolute difference: {m['abs_diff'] * 100:+.2f} percentage points\n"
+        f"- Relative uplift: {m['uplift']:+.1f}%\n"
+        f"- Z-statistic: {m['z_stat']:.4f}\n"
+        f"- p-value: {m['p_value']:.4f}\n"
+        f"- Confidence: {min(m['confidence'], 99.9):.1f}%\n"
+        f"- Statistically significant at 95% threshold: {m['significant']}\n\n"
+        "## Template Recommendation\n"
+        f"{rec_text}\n\n"
+        "## Cover These Sections\n"
+        "1. **What the results mean** — interpret the numbers in plain English\n"
+        "2. **Business implications** — revenue impact, user experience, strategic fit\n"
+        "3. **Statistical caveats** — what the p-value does and does not tell us, "
+        "sample size considerations, potential biases\n"
+        "4. **Risks** — what could go wrong if the recommendation is followed\n"
+        "5. **Recommended next steps** — concrete, prioritized actions\n"
+    )
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.5,
+        max_tokens=900,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a senior data scientist and business strategist writing an A/B test "
+                    "analysis report for a product team. Write in clear, professional prose using "
+                    "markdown formatting (headers, bold, bullet points where appropriate). "
+                    "Do not use jargon without explanation. Your analysis should be actionable."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ── AI: Follow-up Q&A ─────────────────────────────────────────────────────────
+def answer_ab_question(
+    question: str,
+    m: dict,
+    chat_history: list,
+    api_key: str,
+) -> str:
+    """Answer a follow-up question about the A/B test results."""
+    system_prompt = (
+        "You are an expert A/B testing analyst and statistician. Answer questions about "
+        "the following experiment concisely and accurately. Always ground your answers in "
+        "the specific numbers provided. If a question is outside the scope of the test data, "
+        "say so clearly.\n\n"
+        "## Experiment Data\n"
+        f"- Variant A: {m['users_a']:,} users, {m['conv_a']:,} conversions, "
+        f"{m['rate_a'] * 100:.2f}% conversion rate\n"
+        f"- Variant B: {m['users_b']:,} users, {m['conv_b']:,} conversions, "
+        f"{m['rate_b'] * 100:.2f}% conversion rate\n"
+        f"- Absolute difference: {m['abs_diff'] * 100:+.2f} percentage points\n"
+        f"- Relative uplift: {m['uplift']:+.1f}%\n"
+        f"- Z-statistic: {m['z_stat']:.4f}, p-value: {m['p_value']:.4f}\n"
+        f"- Confidence: {min(m['confidence'], 99.9):.1f}%\n"
+        f"- Statistically significant: {m['significant']}\n"
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(chat_history)
+    messages.append({"role": "user", "content": question})
+
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.4,
+        max_tokens=400,
+        messages=messages,
+    )
+    return response.choices[0].message.content.strip()
 
 
 # ── File loading ──────────────────────────────────────────────────────────────
@@ -165,6 +300,12 @@ if uploaded_file is not None:
         st.error(f"Error computing metrics: {e}")
         st.stop()
 
+    # ── Invalidate AI caches when a new file is uploaded ──────────────────────
+    if st.session_state.get("_ai_file") != uploaded_file.name:
+        st.session_state["_ai_file"] = uploaded_file.name
+        for key in ["ai_exec_summary", "ai_narrative", "chat_history"]:
+            st.session_state.pop(key, None)
+
     # ── Metrics display ───────────────────────────────────────────────────────
     st.subheader("Key Metrics")
 
@@ -178,6 +319,19 @@ if uploaded_file is not None:
                 help="Percentage change in conversion rate from A to B")
     col4.metric("p-value", f"{m['p_value']:.4f}",
                 help="Probability of observing this result by chance if there is no real difference")
+
+    # ── AI: Executive summary (auto-generated) ────────────────────────────────
+    if openai_api_key:
+        if "ai_exec_summary" not in st.session_state:
+            with st.spinner("Generating executive summary..."):
+                try:
+                    st.session_state["ai_exec_summary"] = generate_exec_summary(
+                        m, openai_api_key
+                    )
+                except Exception as e:
+                    st.warning(f"Could not generate executive summary: {e}")
+        if st.session_state.get("ai_exec_summary"):
+            st.info(st.session_state["ai_exec_summary"])
 
     st.markdown("---")
 
@@ -204,6 +358,65 @@ if uploaded_file is not None:
         st.error(rec_text)
     else:
         st.warning(rec_text)
+
+    # ── AI: Narrative analysis ────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("AI Analysis")
+
+    if not openai_api_key:
+        st.caption("Add your OpenAI API key in the sidebar to enable AI-powered analysis.")
+    else:
+        btn_label = (
+            "Regenerate AI Analysis"
+            if "ai_narrative" in st.session_state
+            else "Generate AI Analysis"
+        )
+        if st.button(btn_label, key="btn_narrative"):
+            with st.spinner("Generating analysis..."):
+                try:
+                    st.session_state["ai_narrative"] = generate_narrative(
+                        m, rec_text, openai_api_key
+                    )
+                except Exception as e:
+                    st.error(f"Could not generate analysis: {e}")
+
+        if "ai_narrative" in st.session_state:
+            st.markdown(st.session_state["ai_narrative"])
+
+    # ── AI: Follow-up Q&A chat ────────────────────────────────────────────────
+    if openai_api_key and "ai_narrative" in st.session_state:
+        st.markdown("---")
+        st.subheader("Ask Follow-up Questions")
+
+        for msg in st.session_state.get("chat_history", []):
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        if st.session_state.get("chat_history"):
+            if st.button("Clear chat history", key="btn_clear_chat"):
+                st.session_state["chat_history"] = []
+                st.rerun()
+
+        if prompt := st.chat_input("Ask a question about these results..."):
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            history = st.session_state.get("chat_history", [])
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        answer = answer_ab_question(
+                            prompt, m, history, openai_api_key
+                        )
+                    except Exception as e:
+                        answer = f"Sorry, I could not generate a response: {e}"
+                st.markdown(answer)
+
+            st.session_state["chat_history"] = history + [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": answer},
+            ]
 
 else:
     st.info(
