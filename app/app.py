@@ -46,7 +46,7 @@ def extract_text_from_pdf(uploaded_file) -> str:
         pages = []
         for page in reader.pages:
             text = page.extract_text() or ""
-            pages.append(to_ascii_safe(text))      # ← ASCII-safe fix
+            pages.append(to_ascii_safe(text))
         return "\n".join(pages)
     finally:
         os.unlink(tmp_path)
@@ -56,22 +56,35 @@ def extract_text_from_excel(uploaded_file) -> str:
     df = pd.read_excel(uploaded_file, engine="openpyxl")
     rows = []
     for _, row in df.iterrows():
-        # Convert every cell value to string first, then sanitize
         line = " | ".join(
             f"{to_ascii_safe(str(col))}: {to_ascii_safe(str(val))}"
             for col, val in row.items()
         )
         rows.append(line)
-    return "\n".join(rows)                          # ← ASCII-safe fix
+    return "\n".join(rows)
 
 
 def extract_text_from_csv(uploaded_file) -> str:
-    # Try UTF-8 first; fall back to latin-1 which never fails
+    # quoting=3 (QUOTE_NONE) → don't treat " as special
+    # escapechar="\\" → required when quoting=QUOTE_NONE
+    # on_bad_lines="skip" → drop malformed/unclosed-quote rows silently
     try:
-        df = pd.read_csv(uploaded_file, encoding="utf-8")
+        df = pd.read_csv(
+            uploaded_file,
+            encoding="utf-8",
+            quoting=3,
+            escapechar="\\",
+            on_bad_lines="skip",
+        )
     except UnicodeDecodeError:
         uploaded_file.seek(0)
-        df = pd.read_csv(uploaded_file, encoding="latin-1")
+        df = pd.read_csv(
+            uploaded_file,
+            encoding="latin-1",
+            quoting=3,
+            escapechar="\\",
+            on_bad_lines="skip",
+        )
 
     rows = []
     for _, row in df.iterrows():
@@ -141,7 +154,7 @@ def answer_question(question: str, index, chunks: list, api_key: str) -> str:
 # ── Main UI ───────────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader(
     "Upload a PDF, Excel, or CSV file",
-    type=["pdf", "xlsx", "csv"],          # ← CSV added here
+    type=["pdf", "xlsx", "csv"],
 )
 
 if uploaded_file is not None:
